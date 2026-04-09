@@ -1,7 +1,5 @@
 local M = {}
 local repos = require("tree-sitter-manager.repos")
-local languages = vim.tbl_keys(repos)
-table.sort(languages)
 
 local src = debug.getinfo(1, "S").source
 local abs = src:sub(1, 1) == "@" and vim.fn.fnamemodify(src:sub(2), ":p") or ""
@@ -12,8 +10,17 @@ local footer = " [i] Install  [x] Remove  [u] Update  [r] Refresh  [q] Close "
 local cfg = {
     parser_dir = vim.fn.stdpath("data") .. "/site/parser",
     query_dir = vim.fn.stdpath("data") .. "/site/queries",
+    ---@type table<string, string|{install_info?: {url: string, location?: string, revision?: string, branch?: string, generate?: boolean, use_repo_queries?: boolean}, requires?: string[]}>
+    languages = {},
     ensure_installed = {},
+
 }
+
+-- Effective repos: built-in repos merged with user-defined overrides from cfg.languages.
+-- Recomputed in setup() after merging user config.
+local effective_repos = repos
+local languages = vim.tbl_keys(repos)
+table.sort(languages)
 
 local function ext()
     local sys = vim.uv.os_uname().sysname
@@ -52,7 +59,7 @@ local function copy_dir(src, dst)
 end
 
 local function get_repo_info(lang)
-    local entry = repos[lang]
+    local entry = effective_repos[lang]
     if not entry then return nil end
     if type(entry) == "string" then return { url = entry, location = lang } end
     if entry.install_info then
@@ -62,13 +69,14 @@ local function get_repo_info(lang)
             revision = entry.install_info.revision,
             branch = entry.install_info.branch,
             generate = entry.install_info.generate,
+            use_repo_queries = entry.install_info.use_repo_queries,
         }
     end
     return nil
 end
 
 local function get_requires(lang)
-    local entry = repos[lang]
+    local entry = effective_repos[lang]
     return (type(entry) == "table" and entry.requires) or {}
 end
 
@@ -95,6 +103,17 @@ local function copy_queries(lang, location)
     if vim.uv.fs_stat(s) then
         copy_dir(s, d)
     end
+end
+
+-- Copies query files from the cloned grammar repository into query_dir.
+-- Expects queries at <build_dir>/queries/ (standard tree-sitter layout).
+local function copy_queries_from_repo(lang, build_dir)
+    local qs = build_dir .. "/queries"
+    if vim.uv.fs_stat(qs) then
+        copy_dir(qs, cfg.query_dir .. "/" .. lang)
+        return true
+    end
+    return false
 end
 
 function M._install_single(lang)
@@ -148,9 +167,22 @@ function M._install_single(lang)
         vim.fn.delete(tmp, "rf")
         return false
     end
+
+    -- Copy queries from the cloned repo when use_repo_queries is set.
+    -- Must happen before tmp is deleted.
+    local used_repo_queries = false
+    if info.use_repo_queries then
+        used_repo_queries = copy_queries_from_repo(lang, build_dir)
+        if not used_repo_queries then
+            vim.notify("⚠ No queries/ found in repo for " .. lang .. ", falling back to bundled queries", 2)
+        end
+    end
+
     vim.fn.delete(tmp, "rf")
 
-    copy_queries(lang, location)
+    if not used_repo_queries then
+        copy_queries(lang, location)
+    end
 
     vim.notify("✓ " .. lang .. " installed")
     return true
@@ -211,6 +243,13 @@ end
 
 function M.setup(opts)
     cfg = vim.tbl_deep_extend("force", cfg, opts or {})
+
+    -- Merge built-in repos with user-defined language overrides.
+    -- User entries take precedence, allowing custom forks and new languages.
+    effective_repos = vim.tbl_deep_extend("force", vim.deepcopy(repos), cfg.languages)
+    languages = vim.tbl_keys(effective_repos)
+    table.sort(languages)
+
     vim.fn.mkdir(cfg.parser_dir, "p")
     vim.fn.mkdir(cfg.query_dir, "p")
 
@@ -243,10 +282,10 @@ function M.setup(opts)
         if vim.uv.fs_stat(ppath(lang)) then table.insert(installed_ft, lang) end
     end
     if #installed_ft > 0 then
-        vim.api.nvim_create_autocmd('FileType', {
+        vim.api.nvim_create_autocmd("FileType", {
             pattern = installed_ft,
             callback = function() vim.treesitter.start() end,
-            desc = 'Auto-enable treesitter for installed parsers'
+            desc = "Auto-enable treesitter for installed parsers",
         })
     end
 end
@@ -267,7 +306,7 @@ function M.open()
         row = math.floor((vim.o.lines - h) / 2),
         col = math.floor((vim.o.columns - w) / 2),
         title = footer,
-        title_pos = "center"
+        title_pos = "center",
     })
     render(buf)
 
@@ -282,7 +321,7 @@ end
 
 function M._act(action)
     local lang = vim.api.nvim_get_current_line():match("^%s*([%w_]+)")
-    if not lang or not repos[lang] then return end
+    if not lang or not effective_repos[lang] then return end
     if action == "install" then
         install(lang)
     elseif action == "remove" then
