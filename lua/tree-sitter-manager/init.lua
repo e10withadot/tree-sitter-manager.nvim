@@ -164,7 +164,7 @@ function M._install_single(lang)
     end
 
     local build_dir = tmp
-    if location ~= lang then
+    if info.location then
         vim.notify("LOCATION " .. location)
         build_dir = tmp .. "/" .. location
     end
